@@ -446,7 +446,7 @@ impl App {
         let command = self.input.trim().to_string();
         if command.is_empty() {
             if let Some(table) = self.metadata.tables.get(self.selected_table).cloned() {
-                self.sample_table(&table).await;
+                self.load_table_detail(&table).await;
             }
             return;
         }

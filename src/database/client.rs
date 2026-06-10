@@ -56,7 +56,7 @@ impl DatabaseClient {
                 Ok(postgres_rows(rows))
             }
             Self::Mysql(pool) => {
-                let rows = sqlx::query(sql).fetch_all(pool).await?;
+                let rows = sqlx::raw_sql(sql).fetch_all(pool).await?;
                 Ok(mysql_rows(rows))
             }
         }
@@ -168,9 +168,9 @@ fn decode_text<'r, R>(row: &'r R, index: usize) -> Option<String>
 where
     R: Row,
     usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    String: sqlx::Decode<'r, R::Database>,
 {
-    row.try_get::<String, _>(index).ok()
+    row.try_get_unchecked::<String, _>(index).ok()
 }
 
 fn decode_postgres_by_type(row: &PgRow, index: usize, type_name: &str) -> Option<String> {
@@ -227,7 +227,9 @@ fn decode_postgres_by_type(row: &PgRow, index: usize, type_name: &str) -> Option
 
 fn decode_mysql_by_type(row: &MySqlRow, index: usize, type_name: &str) -> Option<String> {
     match type_name {
-        "boolean" | "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => {
+        "boolean" => decode_mysql_unsigned_integer(row, index)
+            .or_else(|| decode_mysql_signed_integer(row, index)),
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => {
             decode_mysql_signed_integer(row, index)
         }
         "tinyint unsigned" | "smallint unsigned" | "mediumint unsigned" | "int unsigned"
@@ -264,19 +266,19 @@ fn decode_mysql_by_type(row: &MySqlRow, index: usize, type_name: &str) -> Option
 }
 
 fn decode_mysql_signed_integer(row: &MySqlRow, index: usize) -> Option<String> {
-    row.try_get::<i64, _>(index)
+    row.try_get_unchecked::<i64, _>(index)
         .ok()
-        .or_else(|| row.try_get::<i32, _>(index).ok().map(i64::from))
-        .or_else(|| row.try_get::<i16, _>(index).ok().map(i64::from))
-        .or_else(|| row.try_get::<i8, _>(index).ok().map(i64::from))
+        .or_else(|| row.try_get_unchecked::<i32, _>(index).ok().map(i64::from))
+        .or_else(|| row.try_get_unchecked::<i16, _>(index).ok().map(i64::from))
+        .or_else(|| row.try_get_unchecked::<i8, _>(index).ok().map(i64::from))
         .map(|value| value.to_string())
 }
 
 fn decode_mysql_unsigned_integer(row: &MySqlRow, index: usize) -> Option<String> {
-    row.try_get::<u64, _>(index)
+    row.try_get_unchecked::<u64, _>(index)
         .ok()
-        .or_else(|| row.try_get::<u32, _>(index).ok().map(u64::from))
-        .or_else(|| row.try_get::<u16, _>(index).ok().map(u64::from))
-        .or_else(|| row.try_get::<u8, _>(index).ok().map(u64::from))
+        .or_else(|| row.try_get_unchecked::<u32, _>(index).ok().map(u64::from))
+        .or_else(|| row.try_get_unchecked::<u16, _>(index).ok().map(u64::from))
+        .or_else(|| row.try_get_unchecked::<u8, _>(index).ok().map(u64::from))
         .map(|value| value.to_string())
 }
