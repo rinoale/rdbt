@@ -36,6 +36,7 @@ that are conservatively classified as read-only `SELECT` queries. Use
 - `F2`: toggle safe mode
 - `F5`: refresh schema/table metadata
 - `Tab`: switch focus between browser and SQL prompt
+- `:`: focus SQL prompt and start an rdbt command from any pane
 - `Up`/`Down`: move table selection or query history
 - Mouse wheel: scroll the browser or output under the pointer
 - Browser click: open a read-only table detail view with columns and 10 sampled rows

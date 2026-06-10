@@ -286,6 +286,7 @@ impl App {
             KeyCode::Backspace if self.focus == Focus::Prompt => {
                 self.input.pop();
             }
+            KeyCode::Char(':') if self.focus != Focus::Prompt => self.enter_command_mode(),
             KeyCode::Char(ch) if self.focus == Focus::Prompt => {
                 self.input.push(ch);
                 self.history_cursor = None;
@@ -294,6 +295,14 @@ impl App {
             KeyCode::Down => self.move_down(),
             _ => {}
         }
+    }
+
+    fn enter_command_mode(&mut self) {
+        self.focus = Focus::Prompt;
+        self.active_dropdown = None;
+        self.history_cursor = None;
+        self.input.clear();
+        self.input.push(':');
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent) {
