@@ -1,7 +1,13 @@
-use std::time::Duration;
+use std::{io::stdout, time::Duration};
 
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    execute,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -13,17 +19,27 @@ use ratatui::{
 use crate::{
     args::Config,
     database::{
-        DatabaseClient, DatabaseStrategy, MetadataCache, QueryOutput, TableRef, strategy_for,
+        DatabaseClient, DatabaseStrategy, MetadataCache, QueryOutput, SampleOrder, TableRef,
+        strategy_for,
     },
     safety,
 };
 
-const SAMPLE_LIMIT: u16 = 100;
+const COMMAND_SAMPLE_LIMIT: u16 = 100;
+const DEFAULT_PREVIEW_LIMIT: u16 = 10;
+const LIMIT_OPTIONS: &[u16] = &[10, 25, 50, 100];
+const SCROLL_STEP: isize = 3;
 
 pub async fn run(mut app: App) -> Result<()> {
     let mut terminal = ratatui::init();
+    if let Err(error) = execute!(stdout(), EnableMouseCapture) {
+        ratatui::restore();
+        return Err(error.into());
+    }
     let result = app.run(&mut terminal).await;
+    let disable_result = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
+    disable_result?;
     result
 }
 
@@ -31,6 +47,112 @@ pub async fn run(mut app: App) -> Result<()> {
 enum Focus {
     Browser,
     Prompt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropdownKind {
+    Limit,
+    Order,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewOrder {
+    Natural,
+    FirstColumnAsc,
+    FirstColumnDesc,
+}
+
+impl PreviewOrder {
+    fn all() -> &'static [Self] {
+        &[Self::Natural, Self::FirstColumnAsc, Self::FirstColumnDesc]
+    }
+
+    fn label(self, column: Option<&str>) -> String {
+        match self {
+            Self::Natural => "natural".to_string(),
+            Self::FirstColumnAsc => column
+                .map(|column| format!("{column} asc"))
+                .unwrap_or_else(|| "first column asc".to_string()),
+            Self::FirstColumnDesc => column
+                .map(|column| format!("{column} desc"))
+                .unwrap_or_else(|| "first column desc".to_string()),
+        }
+    }
+
+    fn to_sample_order(self, column: Option<&str>) -> SampleOrder {
+        match (self, column) {
+            (Self::Natural, _) | (_, None) => SampleOrder::Natural,
+            (Self::FirstColumnAsc, Some(column)) => SampleOrder::Asc(column.to_string()),
+            (Self::FirstColumnDesc, Some(column)) => SampleOrder::Desc(column.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewOptions {
+    limit: u16,
+    order: PreviewOrder,
+}
+
+impl Default for PreviewOptions {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_PREVIEW_LIMIT,
+            order: PreviewOrder::Natural,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TableDetail {
+    table: TableRef,
+    columns: QueryOutput,
+    rows: QueryOutput,
+    order_column: Option<String>,
+    options: PreviewOptions,
+}
+
+#[derive(Debug, Clone)]
+enum OutputView {
+    Query(QueryOutput),
+    Detail(TableDetail),
+}
+
+impl OutputView {
+    fn message(message: impl Into<String>) -> Self {
+        Self::Query(QueryOutput::message(message))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DropdownArea {
+    kind: DropdownKind,
+    rect: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiLayout {
+    browser: Rect,
+    output: Rect,
+    output_rows: Rect,
+    prompt: Rect,
+    limit_control: Rect,
+    order_control: Rect,
+    dropdown: Option<DropdownArea>,
+}
+
+impl Default for UiLayout {
+    fn default() -> Self {
+        Self {
+            browser: Rect::new(0, 0, 0, 0),
+            output: Rect::new(0, 0, 0, 0),
+            output_rows: Rect::new(0, 0, 0, 0),
+            prompt: Rect::new(0, 0, 0, 0),
+            limit_control: Rect::new(0, 0, 0, 0),
+            order_control: Rect::new(0, 0, 0, 0),
+            dropdown: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,13 +203,18 @@ pub struct App {
     client: DatabaseClient,
     strategy: Box<dyn DatabaseStrategy>,
     metadata: MetadataCache,
-    output: QueryOutput,
+    view: OutputView,
     input: String,
     status: String,
     history: Vec<String>,
     history_cursor: Option<usize>,
     focus: Focus,
     selected_table: usize,
+    browser_scroll: usize,
+    output_scroll: usize,
+    preview_options: PreviewOptions,
+    active_dropdown: Option<DropdownKind>,
+    layout: UiLayout,
     should_quit: bool,
 }
 
@@ -103,13 +230,18 @@ impl App {
             client,
             strategy,
             metadata: MetadataCache::default(),
-            output: QueryOutput::message(format!("Connected to {db_name}. Loading metadata...")),
+            view: OutputView::message(format!("Connected to {db_name}. Loading metadata...")),
             input: String::new(),
             status: "Connected".to_string(),
             history: Vec::new(),
             history_cursor: None,
             focus: Focus::Prompt,
             selected_table: 0,
+            browser_scroll: 0,
+            output_scroll: 0,
+            preview_options: PreviewOptions::default(),
+            active_dropdown: None,
+            layout: UiLayout::default(),
             should_quit: false,
         }
     }
@@ -120,11 +252,14 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
 
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.handle_key(key).await;
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        self.handle_key(key).await;
+                    }
+                    Event::Mouse(mouse) => self.handle_mouse(mouse).await,
+                    _ => {}
+                }
             }
         }
 
@@ -140,6 +275,7 @@ impl App {
             KeyCode::F(2) => self.toggle_safe_mode(),
             KeyCode::F(5) => self.refresh_metadata().await,
             KeyCode::Tab => {
+                self.active_dropdown = None;
                 self.focus = if self.focus == Focus::Prompt {
                     Focus::Browser
                 } else {
@@ -160,10 +296,113 @@ impl App {
         }
     }
 
+    async fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, -SCROLL_STEP),
+            MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, SCROLL_STEP),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.click_at(mouse.column, mouse.row).await;
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_at(&mut self, x: u16, y: u16, delta: isize) {
+        self.active_dropdown = None;
+        if contains(self.layout.browser, x, y) {
+            self.focus = Focus::Browser;
+            self.browser_scroll = scrolled(
+                self.browser_scroll,
+                delta,
+                self.metadata.tables.len(),
+                block_inner(self.layout.browser).height as usize,
+            );
+        } else if contains(self.layout.output, x, y) {
+            self.output_scroll = scrolled(
+                self.output_scroll,
+                delta,
+                self.output_row_count(),
+                self.layout.output_rows.height.saturating_sub(1) as usize,
+            );
+        }
+    }
+
+    async fn click_at(&mut self, x: u16, y: u16) {
+        if let Some(dropdown) = self.layout.dropdown
+            && contains(dropdown.rect, x, y)
+        {
+            self.select_dropdown_value(dropdown.kind, y).await;
+            return;
+        }
+
+        self.active_dropdown = None;
+
+        if contains(self.layout.limit_control, x, y) {
+            self.active_dropdown = Some(DropdownKind::Limit);
+            return;
+        }
+
+        if contains(self.layout.order_control, x, y) {
+            self.active_dropdown = Some(DropdownKind::Order);
+            return;
+        }
+
+        let browser_inner = block_inner(self.layout.browser);
+        if contains(browser_inner, x, y) {
+            self.focus = Focus::Browser;
+            let row = usize::from(y.saturating_sub(browser_inner.y));
+            let index = self.browser_scroll + row;
+            if let Some(table) = self.metadata.tables.get(index).cloned() {
+                self.selected_table = index;
+                self.load_table_detail(&table).await;
+            }
+            return;
+        }
+
+        if contains(self.layout.prompt, x, y) {
+            self.focus = Focus::Prompt;
+        }
+    }
+
+    async fn select_dropdown_value(&mut self, kind: DropdownKind, y: u16) {
+        let Some(dropdown) = self.layout.dropdown else {
+            return;
+        };
+        if y <= dropdown.rect.y || y >= dropdown.rect.y + dropdown.rect.height.saturating_sub(1) {
+            self.active_dropdown = None;
+            return;
+        }
+        let row = usize::from(y.saturating_sub(dropdown.rect.y + 1));
+
+        match kind {
+            DropdownKind::Limit => {
+                let Some(limit) = LIMIT_OPTIONS.get(row).copied() else {
+                    self.active_dropdown = None;
+                    return;
+                };
+                self.preview_options.limit = limit;
+            }
+            DropdownKind::Order => {
+                let Some(order) = PreviewOrder::all().get(row).copied() else {
+                    self.active_dropdown = None;
+                    return;
+                };
+                self.preview_options.order = order;
+            }
+        }
+
+        self.active_dropdown = None;
+        if let OutputView::Detail(detail) = &self.view {
+            let table = detail.table.clone();
+            self.load_table_detail(&table).await;
+        }
+    }
+
     fn move_up(&mut self) {
         match self.focus {
             Focus::Browser => {
                 self.selected_table = self.selected_table.saturating_sub(1);
+                self.ensure_selected_table_visible();
             }
             Focus::Prompt => {
                 if self.history.is_empty() {
@@ -186,6 +425,7 @@ impl App {
                 if self.selected_table + 1 < self.metadata.tables.len() {
                     self.selected_table += 1;
                 }
+                self.ensure_selected_table_visible();
             }
             Focus::Prompt => {
                 let Some(cursor) = self.history_cursor else {
@@ -270,7 +510,7 @@ impl App {
         if self.config.safe_mode {
             let decision = safety::classify(sql);
             if !decision.is_allowed() {
-                self.output = QueryOutput::message(match decision {
+                self.view = OutputView::message(match decision {
                     safety::SafetyDecision::Allow => "allowed".to_string(),
                     safety::SafetyDecision::Deny(reason) => reason,
                 });
@@ -296,16 +536,73 @@ impl App {
     }
 
     async fn sample_table(&mut self, table: &TableRef) {
-        let sql = self.strategy.sample_rows_sql(table, SAMPLE_LIMIT);
+        let sql = self
+            .strategy
+            .sample_rows_sql(table, COMMAND_SAMPLE_LIMIT, &SampleOrder::Natural);
         self.run_strategy_query(sql, &format!("sample {}", table.display_name()))
             .await;
+    }
+
+    async fn load_table_detail(&mut self, table: &TableRef) {
+        // Mouse-driven table inspection is deliberately read-only: it only runs
+        // metadata SELECTs and SELECT samples built by the database strategy.
+        self.status = format!("loading {}", table.display_name());
+        self.output_scroll = 0;
+
+        let columns = match self
+            .client
+            .query(&self.strategy.describe_table_sql(table))
+            .await
+        {
+            Ok(columns) => columns,
+            Err(error) => {
+                self.view = OutputView::message(error.to_string());
+                self.status = "describe failed".to_string();
+                return;
+            }
+        };
+
+        let order_column = first_column_name(&columns);
+        let order_label = self.preview_options.order.label(order_column.as_deref());
+        let order = self
+            .preview_options
+            .order
+            .to_sample_order(order_column.as_deref());
+        let rows_sql = self
+            .strategy
+            .sample_rows_sql(table, self.preview_options.limit, &order);
+        let rows = self.client.query(&rows_sql).await;
+
+        match rows {
+            Ok(rows) => {
+                self.view = OutputView::Detail(TableDetail {
+                    table: table.clone(),
+                    columns,
+                    rows,
+                    order_column,
+                    options: self.preview_options,
+                });
+                self.status = format!(
+                    "{} preview: {} row limit, {} order",
+                    table.display_name(),
+                    self.preview_options.limit,
+                    order_label
+                );
+            }
+            Err(error) => {
+                self.view = OutputView::message(error.to_string());
+                self.status = "sample failed".to_string();
+            }
+        }
     }
 
     async fn refresh_metadata(&mut self) {
         self.metadata.loaded = false;
         self.metadata.schemas.clear();
         self.metadata.tables.clear();
-        self.output = QueryOutput::message("Refreshing metadata...");
+        self.browser_scroll = 0;
+        self.output_scroll = 0;
+        self.view = OutputView::message("Refreshing metadata...");
         self.load_metadata_if_needed().await;
     }
 
@@ -325,7 +622,8 @@ impl App {
                 self.selected_table = self
                     .selected_table
                     .min(self.metadata.tables.len().saturating_sub(1));
-                self.output = tables;
+                self.view = OutputView::Query(tables);
+                self.output_scroll = 0;
                 self.status = format!(
                     "loaded {} schema(s), {} table(s)",
                     self.metadata.schemas.len(),
@@ -333,7 +631,7 @@ impl App {
                 );
             }
             (Err(error), _) | (_, Err(error)) => {
-                self.output = QueryOutput::message(format!("metadata load failed: {error}"));
+                self.view = OutputView::message(format!("metadata load failed: {error}"));
                 self.status = "metadata load failed".to_string();
             }
         }
@@ -375,11 +673,13 @@ impl App {
     fn set_output_result(&mut self, result: Result<QueryOutput>, status: impl Into<String>) {
         match result {
             Ok(output) => {
-                self.output = output;
+                self.view = OutputView::Query(output);
+                self.output_scroll = 0;
                 self.status = status.into();
             }
             Err(error) => {
-                self.output = QueryOutput::message(error.to_string());
+                self.view = OutputView::message(error.to_string());
+                self.output_scroll = 0;
                 self.status = "SQL failed".to_string();
             }
         }
@@ -399,7 +699,7 @@ impl App {
     }
 
     fn show_help(&mut self) {
-        self.output = QueryOutput {
+        self.view = OutputView::Query(QueryOutput {
             columns: vec!["command".to_string(), "description".to_string()],
             rows: vec![
                 vec![":schemas".to_string(), "list schemas/databases".to_string()],
@@ -428,11 +728,50 @@ impl App {
                 vec![":quit".to_string(), "exit rdbt".to_string()],
             ],
             message: "rdbt commands".to_string(),
-        };
+        });
+        self.output_scroll = 0;
         self.status = "help".to_string();
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn output_row_count(&self) -> usize {
+        match &self.view {
+            OutputView::Query(output) => output.rows.len(),
+            OutputView::Detail(detail) => detail.rows.rows.len(),
+        }
+    }
+
+    fn clamp_scrolls(&mut self) {
+        let browser_height = block_inner(self.layout.browser).height as usize;
+        self.browser_scroll = clamp_scroll(
+            self.browser_scroll,
+            self.metadata.tables.len(),
+            browser_height,
+        );
+        self.clamp_output_scroll(self.output_row_count());
+    }
+
+    fn clamp_output_scroll(&mut self, row_count: usize) {
+        self.output_scroll = clamp_scroll(
+            self.output_scroll,
+            row_count,
+            self.layout.output_rows.height.saturating_sub(1) as usize,
+        );
+    }
+
+    fn ensure_selected_table_visible(&mut self) {
+        let visible_rows = block_inner(self.layout.browser).height as usize;
+        if visible_rows == 0 {
+            return;
+        }
+
+        if self.selected_table < self.browser_scroll {
+            self.browser_scroll = self.selected_table;
+        } else if self.selected_table >= self.browser_scroll + visible_rows {
+            self.browser_scroll = self.selected_table + 1 - visible_rows;
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
         let theme = if self.config.safe_mode {
             Theme::safe()
         } else {
@@ -455,6 +794,13 @@ impl App {
         let [browser, main] =
             Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
                 .areas(body);
+        self.layout = UiLayout {
+            browser,
+            output: main,
+            prompt: bottom,
+            ..UiLayout::default()
+        };
+        self.clamp_scrolls();
 
         self.render_top(frame, top, &theme);
         self.render_browser(frame, browser, &theme);
@@ -500,6 +846,7 @@ impl App {
                 .tables
                 .iter()
                 .enumerate()
+                .skip(self.browser_scroll)
                 .map(|(index, table)| {
                     let style = if index == self.selected_table {
                         Style::default().fg(theme.text).bg(theme.selected).bold()
@@ -535,14 +882,213 @@ impl App {
         frame.render_widget(list, area);
     }
 
-    fn render_output(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        if self.output.columns.is_empty() {
+    fn render_output(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.layout.limit_control = Rect::new(0, 0, 0, 0);
+        self.layout.order_control = Rect::new(0, 0, 0, 0);
+        self.layout.dropdown = None;
+
+        let view = self.view.clone();
+        match view {
+            OutputView::Query(output) => {
+                self.layout.output_rows = block_inner(area);
+                self.clamp_output_scroll(output.rows.len());
+                self.render_table_output(frame, area, theme, &output, "Output", self.output_scroll);
+            }
+            OutputView::Detail(detail) => self.render_table_detail(frame, area, theme, &detail),
+        }
+    }
+
+    fn render_table_detail(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        detail: &TableDetail,
+    ) {
+        let column_height =
+            (detail.columns.rows.len() as u16 + 3).clamp(6, area.height.saturating_sub(8).max(6));
+        let [controls, columns, rows] = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Length(column_height),
+            Constraint::Min(5),
+        ])
+        .areas(area);
+
+        self.render_preview_controls(frame, controls, theme, detail);
+        self.render_table_output(
+            frame,
+            columns,
+            theme,
+            &detail.columns,
+            &format!("Columns - {}", detail.table.display_name()),
+            0,
+        );
+
+        self.layout.output_rows = block_inner(rows);
+        self.clamp_output_scroll(detail.rows.rows.len());
+        self.render_table_output(
+            frame,
+            rows,
+            theme,
+            &detail.rows,
+            &format!(
+                "Rows - limit {} - {}",
+                detail.options.limit,
+                detail.options.order.label(detail.order_column.as_deref())
+            ),
+            self.output_scroll,
+        );
+
+        self.render_dropdown(frame, theme, detail.order_column.as_deref());
+    }
+
+    fn render_preview_controls(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        detail: &TableDetail,
+    ) {
+        let block = Block::new()
+            .title("Table Preview")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border))
+            .style(Style::default().bg(theme.panel));
+        frame.render_widget(block, area);
+
+        let inner = block_inner(area);
+        if inner.height == 0 {
+            return;
+        }
+
+        let limit_width = 18.min(inner.width);
+        let limit = Rect::new(inner.x, inner.y, limit_width, inner.height.min(3));
+        let order_x = limit.x.saturating_add(limit.width).saturating_add(1);
+        let order_width = inner
+            .x
+            .saturating_add(inner.width)
+            .saturating_sub(order_x)
+            .min(40);
+        let order = Rect::new(order_x, inner.y, order_width, inner.height.min(3));
+
+        self.layout.limit_control = limit;
+        self.layout.order_control = order;
+
+        self.render_select(
+            frame,
+            limit,
+            theme,
+            "Limit",
+            &detail.options.limit.to_string(),
+            self.active_dropdown == Some(DropdownKind::Limit),
+        );
+        self.render_select(
+            frame,
+            order,
+            theme,
+            "Order",
+            &detail.options.order.label(detail.order_column.as_deref()),
+            self.active_dropdown == Some(DropdownKind::Order),
+        );
+    }
+
+    fn render_select(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        title: &'static str,
+        value: &str,
+        active: bool,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let border = if active { theme.accent } else { theme.border };
+        let block = Block::new()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .style(Style::default().bg(theme.panel));
+        let value = format!(
+            "{} v",
+            truncate(value, area.width.saturating_sub(4) as usize)
+        );
+        frame.render_widget(
+            Paragraph::new(value)
+                .block(block)
+                .style(Style::default().fg(theme.text).bg(theme.panel)),
+            area,
+        );
+    }
+
+    fn render_dropdown(&mut self, frame: &mut Frame, theme: &Theme, order_column: Option<&str>) {
+        let Some(kind) = self.active_dropdown else {
+            return;
+        };
+
+        let (control, items) = match kind {
+            DropdownKind::Limit => (
+                self.layout.limit_control,
+                LIMIT_OPTIONS
+                    .iter()
+                    .map(|limit| limit.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            DropdownKind::Order => (
+                self.layout.order_control,
+                PreviewOrder::all()
+                    .iter()
+                    .map(|order| order.label(order_column))
+                    .collect::<Vec<_>>(),
+            ),
+        };
+
+        if control.width == 0 || control.height == 0 {
+            return;
+        }
+
+        let available_height = frame
+            .area()
+            .height
+            .saturating_sub(control.y + control.height);
+        let height = (items.len() as u16 + 2).min(available_height).max(1);
+        let rect = Rect::new(control.x, control.y + control.height, control.width, height);
+        self.layout.dropdown = Some(DropdownArea { kind, rect });
+
+        let list = List::new(items.into_iter().map(|item| {
+            ListItem::new(Line::from(Span::styled(
+                item,
+                Style::default().fg(theme.text).bg(theme.panel),
+            )))
+        }))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.accent))
+                .style(Style::default().bg(theme.panel)),
+        );
+        frame.render_widget(Clear, rect);
+        frame.render_widget(list, rect);
+    }
+
+    fn render_table_output(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        output: &QueryOutput,
+        title: &str,
+        row_offset: usize,
+    ) {
+        if output.columns.is_empty() {
             let block = Block::new()
-                .title("Output")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border))
                 .style(Style::default().bg(theme.panel));
-            let paragraph = Paragraph::new(self.output.message.clone())
+            let paragraph = Paragraph::new(output.message.clone())
                 .block(block)
                 .style(Style::default().fg(theme.text).bg(theme.panel))
                 .wrap(Wrap { trim: false });
@@ -550,17 +1096,17 @@ impl App {
             return;
         }
 
-        let widths = table_widths(&self.output, area.width.saturating_sub(4));
+        let widths = table_widths(output, area.width.saturating_sub(4));
         let constraints = widths
             .iter()
             .copied()
             .map(Constraint::Length)
             .collect::<Vec<_>>();
-        let header = Row::new(self.output.columns.iter().map(|column| {
+        let header = Row::new(output.columns.iter().map(|column| {
             Cell::from(column.clone())
                 .style(Style::default().fg(Color::Black).bg(theme.accent).bold())
         }));
-        let rows = self.output.rows.iter().map(|row| {
+        let rows = output.rows.iter().skip(row_offset).map(|row| {
             Row::new(row.iter().map(|value| {
                 Cell::from(truncate(value, 64))
                     .style(Style::default().fg(theme.text).bg(theme.panel))
@@ -570,7 +1116,7 @@ impl App {
             .header(header)
             .block(
                 Block::new()
-                    .title(format!("Output - {}", self.output.message))
+                    .title(format!("{title} - {}", output.message))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.border))
                     .style(Style::default().bg(theme.panel)),
@@ -676,6 +1222,40 @@ fn normalize_client_command(command: &str) -> Option<String> {
     None
 }
 
+fn contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
+}
+
+fn block_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn scrolled(current: usize, delta: isize, row_count: usize, visible_rows: usize) -> usize {
+    let next = if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize)
+    };
+    clamp_scroll(next, row_count, visible_rows)
+}
+
+fn clamp_scroll(current: usize, row_count: usize, visible_rows: usize) -> usize {
+    current.min(row_count.saturating_sub(visible_rows.max(1)))
+}
+
+fn first_column_name(output: &QueryOutput) -> Option<String> {
+    let index = column_index(output, "column")?;
+    output.rows.first()?.get(index).cloned()
+}
+
 fn rows_by_column(output: &QueryOutput, name: &str) -> Vec<String> {
     let Some(index) = column_index(output, name) else {
         return Vec::new();
@@ -774,7 +1354,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_client_command;
+    use ratatui::layout::Rect;
+
+    use super::{PreviewOrder, block_inner, clamp_scroll, contains, normalize_client_command};
 
     #[test]
     fn normalizes_psql_table_alias() {
@@ -797,6 +1379,35 @@ mod tests {
         assert_eq!(
             normalize_client_command("DESC users;"),
             Some(":describe users".to_string())
+        );
+    }
+
+    #[test]
+    fn clamps_scroll_to_available_rows() {
+        assert_eq!(clamp_scroll(99, 10, 4), 6);
+        assert_eq!(clamp_scroll(3, 10, 4), 3);
+        assert_eq!(clamp_scroll(3, 2, 4), 0);
+    }
+
+    #[test]
+    fn detects_rect_hits_with_exclusive_end() {
+        let rect = Rect::new(2, 3, 4, 5);
+        assert!(contains(rect, 2, 3));
+        assert!(contains(rect, 5, 7));
+        assert!(!contains(rect, 6, 7));
+        assert!(!contains(rect, 5, 8));
+    }
+
+    #[test]
+    fn block_inner_saturates_small_rects() {
+        assert_eq!(block_inner(Rect::new(0, 0, 1, 1)), Rect::new(1, 1, 0, 0));
+    }
+
+    #[test]
+    fn preview_order_without_column_is_natural() {
+        assert_eq!(
+            PreviewOrder::FirstColumnDesc.to_sample_order(None),
+            crate::database::SampleOrder::Natural
         );
     }
 }

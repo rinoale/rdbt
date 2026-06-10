@@ -37,7 +37,13 @@ that are conservatively classified as read-only `SELECT` queries. Use
 - `F5`: refresh schema/table metadata
 - `Tab`: switch focus between browser and SQL prompt
 - `Up`/`Down`: move table selection or query history
+- Mouse wheel: scroll the browser or output under the pointer
+- Browser click: open a read-only table detail view with columns and 10 sampled rows
+- Preview dropdowns: adjust the table detail row limit and first-column order
 - `Ctrl-C`, `Esc`: quit
+
+Mouse interaction is read-only. It can inspect metadata, sample rows, scroll, and
+change preview options, but it never updates column values or table definitions.
 
 ## rdbt Commands
 
