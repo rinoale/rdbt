@@ -12,9 +12,21 @@ safe-mode theme.
 
 ## Usage
 
+Start onboarding prompts:
+
+```sh
+rdbt
+```
+
+The onboarding flow asks for connector, host, port, user, password, and optional
+schema/database before the TUI starts. Paste works in these prompts, including
+the hidden password entry.
+
 Connect with a URL:
 
 ```sh
+rdbt --url postgres://user:password@localhost:5432/app
+rdbt --url mysql://user:password@localhost:3306/app
 rdbt postgres --url postgres://user:password@localhost:5432/app
 rdbt mysql --url mysql://user:password@localhost:3306/app
 ```
