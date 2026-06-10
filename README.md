@@ -10,6 +10,19 @@ safe-mode theme.
 - Rust: `1.96.0`
 - Ratatui: `0.30.1`
 
+## Install
+
+```sh
+scripts/install.sh
+```
+
+By default, this builds a release binary and installs `rdbt` to
+`/usr/local/bin`. Override the destination with `INSTALL_DIR`:
+
+```sh
+INSTALL_DIR="$HOME/.local/bin" scripts/install.sh
+```
+
 ## Usage
 
 Start onboarding prompts:
