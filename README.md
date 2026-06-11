@@ -62,11 +62,15 @@ that are conservatively classified as read-only `SELECT` queries. Use
 - `F5`: refresh schema/table metadata
 - `Tab`: switch focus between browser and SQL prompt
 - `:`: focus SQL prompt and start an rdbt command from any pane
+- `?`: show command help from non-prompt panes
 - `Up`/`Down`: move table selection or query history
+- `Esc`: cancel a command or close an open dropdown
 - Mouse wheel: scroll the browser or output under the pointer
 - Browser click: open a read-only table detail view with columns and 10 sampled rows
 - Preview dropdowns: adjust the table detail row limit and first-column order
-- `Ctrl-C`, `Esc`: quit
+
+There is no keybinding for quitting. Exit through command mode so accidental key
+presses do not terminate the session.
 
 Mouse interaction is read-only. It can inspect metadata, sample rows, scroll, and
 change preview options, but it never updates column values or table definitions.
@@ -83,7 +87,7 @@ connected DBMS.
 - `:refresh`: clear and reload metadata
 - `:safe`, `:unsafe`, `:safe toggle`: change safe mode
 - `:help`: show command help
-- `:quit`: exit
+- `:q`, `:quit`, `:exit`, `:q!`: exit
 
 Compatibility aliases are routed through the same strategy layer:
 
@@ -91,3 +95,13 @@ Compatibility aliases are routed through the same strategy layer:
 - `\dt`, `show tables` -> `:tables`
 - `\d schema.table`, `desc schema.table`, `describe schema.table` -> `:describe schema.table`
 - `\q` -> `:quit`
+
+## TUI Structure
+
+`rdbt` follows the shared `rustui` scaffold policy:
+
+- `src/tui/keymap.rs`: unified key-to-intent mapping; no quit keybinding
+- `src/tui/command.rs`: command-mode parser and database-client aliases
+- `src/tui/menu.rs`: top hints and command help output
+- `src/tui/theme.rs`: safe/unsafe theme color roles
+- `src/tui.rs`: rdbt-specific application state, database actions, and rendering

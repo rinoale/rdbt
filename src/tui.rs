@@ -1,10 +1,15 @@
 use std::{io::stdout, time::Duration};
 
+mod command;
+mod keymap;
+mod menu;
+mod theme;
+
 use color_eyre::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
 };
@@ -23,6 +28,12 @@ use crate::{
         strategy_for,
     },
     safety,
+};
+
+use self::{
+    command::{RdbtCommand, SafeModeCommand},
+    keymap::{Intent, Keymap, text_input_modifiers},
+    theme::{Theme, ThemeKind},
 };
 
 const COMMAND_SAMPLE_LIMIT: u16 = 100;
@@ -155,49 +166,6 @@ impl Default for UiLayout {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Theme {
-    accent: Color,
-    accent_dark: Color,
-    background: Color,
-    panel: Color,
-    border: Color,
-    selected: Color,
-    text: Color,
-    muted: Color,
-    danger: Color,
-}
-
-impl Theme {
-    fn safe() -> Self {
-        Self {
-            accent: Color::Green,
-            accent_dark: Color::Rgb(0, 75, 45),
-            background: Color::Rgb(4, 18, 12),
-            panel: Color::Rgb(8, 32, 22),
-            border: Color::Rgb(24, 130, 82),
-            selected: Color::Rgb(26, 91, 62),
-            text: Color::Rgb(225, 247, 235),
-            muted: Color::Rgb(131, 179, 154),
-            danger: Color::LightRed,
-        }
-    }
-
-    fn unsafe_mode() -> Self {
-        Self {
-            accent: Color::Red,
-            accent_dark: Color::Rgb(93, 22, 25),
-            background: Color::Rgb(25, 8, 10),
-            panel: Color::Rgb(49, 15, 19),
-            border: Color::Rgb(183, 53, 59),
-            selected: Color::Rgb(103, 31, 36),
-            text: Color::Rgb(255, 230, 230),
-            muted: Color::Rgb(207, 143, 145),
-            danger: Color::LightYellow,
-        }
-    }
-}
-
 pub struct App {
     config: Config,
     client: DatabaseClient,
@@ -215,6 +183,7 @@ pub struct App {
     preview_options: PreviewOptions,
     active_dropdown: Option<DropdownKind>,
     layout: UiLayout,
+    keymap: Keymap,
     should_quit: bool,
 }
 
@@ -242,6 +211,7 @@ impl App {
             preview_options: PreviewOptions::default(),
             active_dropdown: None,
             layout: UiLayout::default(),
+            keymap: Keymap::default(),
             should_quit: false,
         }
     }
@@ -267,33 +237,67 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
+        if self.handle_prompt_text_key(key) {
+            return;
+        }
+
+        if let Some(intent) = self.keymap.intent_for(key) {
+            self.handle_intent(intent).await;
+        }
+    }
+
+    fn handle_prompt_text_key(&mut self, key: KeyEvent) -> bool {
+        if self.focus != Focus::Prompt || !text_input_modifiers(key.modifiers) {
+            return false;
+        }
+
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
-            KeyCode::Esc => self.should_quit = true,
-            KeyCode::F(2) => self.toggle_safe_mode(),
-            KeyCode::F(5) => self.refresh_metadata().await,
-            KeyCode::Tab => {
-                self.active_dropdown = None;
-                self.focus = if self.focus == Focus::Prompt {
-                    Focus::Browser
-                } else {
-                    Focus::Prompt
-                }
-            }
-            KeyCode::Enter => self.submit().await,
-            KeyCode::Backspace if self.focus == Focus::Prompt => {
+            KeyCode::Backspace => {
                 self.input.pop();
+                true
             }
-            KeyCode::Char(':') if self.focus != Focus::Prompt => self.enter_command_mode(),
-            KeyCode::Char(ch) if self.focus == Focus::Prompt => {
+            KeyCode::Char(ch) => {
                 self.input.push(ch);
                 self.history_cursor = None;
+                true
             }
-            KeyCode::Up => self.move_up(),
-            KeyCode::Down => self.move_down(),
-            _ => {}
+            _ => false,
+        }
+    }
+
+    async fn handle_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::EnterCommandMode => self.enter_command_mode(),
+            Intent::Cancel => self.cancel_transient_input(),
+            Intent::Help => self.show_help(),
+            Intent::ToggleSafeMode => self.toggle_safe_mode(),
+            Intent::RefreshMetadata => self.refresh_metadata().await,
+            Intent::ToggleFocus => self.toggle_focus(),
+            Intent::Submit => self.submit().await,
+            Intent::Previous => self.move_up(),
+            Intent::Next => self.move_down(),
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        self.active_dropdown = None;
+        self.focus = if self.focus == Focus::Prompt {
+            Focus::Browser
+        } else {
+            Focus::Prompt
+        };
+    }
+
+    fn cancel_transient_input(&mut self) {
+        if self.active_dropdown.take().is_some() {
+            return;
+        }
+
+        if self.focus == Focus::Prompt && self.input.starts_with(':') {
+            self.input.clear();
+            self.focus = Focus::Browser;
+            self.history_cursor = None;
+            self.status = "command canceled".to_string();
         }
     }
 
@@ -464,7 +468,7 @@ impl App {
         self.history_cursor = None;
         self.input.clear();
 
-        if let Some(command) = normalize_client_command(&command) {
+        if let Some(command) = command::normalize_client_command(&command) {
             self.run_rdbt_command(&command).await;
         } else {
             self.run_sql(&command).await;
@@ -472,46 +476,45 @@ impl App {
     }
 
     async fn run_rdbt_command(&mut self, command: &str) {
-        let mut parts = command[1..].split_whitespace();
-        let Some(name) = parts.next() else {
-            return;
-        };
-
-        match name {
-            "q" | "quit" | "exit" => self.should_quit = true,
-            "help" | "?" => self.show_help(),
-            "safe" => match parts.next() {
-                Some("off") => self.set_safe_mode(false),
-                Some("on") => self.set_safe_mode(true),
-                Some("toggle") | None => self.toggle_safe_mode(),
-                Some(_) => self.status = "usage: :safe [on|off|toggle]".to_string(),
-            },
-            "unsafe" => self.set_safe_mode(false),
-            "refresh" => self.refresh_metadata().await,
-            "schemas" => {
+        match command::parse(command) {
+            RdbtCommand::Quit { force: _ } => self.should_quit = true,
+            RdbtCommand::Help => self.show_help(),
+            RdbtCommand::Safe(SafeModeCommand::Off) => self.set_safe_mode(false),
+            RdbtCommand::Safe(SafeModeCommand::On) => self.set_safe_mode(true),
+            RdbtCommand::Safe(SafeModeCommand::Toggle) => self.toggle_safe_mode(),
+            RdbtCommand::Unsafe => self.set_safe_mode(false),
+            RdbtCommand::Refresh => self.refresh_metadata().await,
+            RdbtCommand::Schemas => {
                 self.run_strategy_query(self.strategy.list_schemas_sql(), "schemas")
                     .await
             }
-            "tables" => {
+            RdbtCommand::Tables => {
                 self.run_strategy_query(self.strategy.list_tables_sql(), "tables")
                     .await
             }
-            "describe" | "desc" => {
-                if let Some(table) = self.resolve_table(parts.next()) {
+            RdbtCommand::Describe(table_name) => {
+                if let Some(table) = self.resolve_table(table_name.as_deref()) {
                     let sql = self.strategy.describe_table_sql(&table);
                     self.run_strategy_query(sql, "describe").await;
                 } else {
                     self.status = "usage: :describe schema.table".to_string();
                 }
             }
-            "sample" | "select" => {
-                if let Some(table) = self.resolve_table(parts.next()) {
+            RdbtCommand::Sample(table_name) => {
+                if let Some(table) = self.resolve_table(table_name.as_deref()) {
                     self.sample_table(&table).await;
                 } else {
                     self.status = "usage: :sample schema.table".to_string();
                 }
             }
-            _ => self.status = format!("unknown rdbt command: :{name}"),
+            RdbtCommand::Unknown(name) => {
+                if name == "safe" {
+                    self.status = "usage: :safe [on|off|toggle]".to_string();
+                } else {
+                    self.status = format!("unknown rdbt command: :{name}");
+                }
+            }
+            RdbtCommand::Empty => {}
         }
     }
 
@@ -708,36 +711,7 @@ impl App {
     }
 
     fn show_help(&mut self) {
-        self.view = OutputView::Query(QueryOutput {
-            columns: vec!["command".to_string(), "description".to_string()],
-            rows: vec![
-                vec![":schemas".to_string(), "list schemas/databases".to_string()],
-                vec![":tables".to_string(), "list tables".to_string()],
-                vec![
-                    ":describe schema.table".to_string(),
-                    "show table columns".to_string(),
-                ],
-                vec![
-                    ":sample schema.table".to_string(),
-                    "show first 100 rows".to_string(),
-                ],
-                vec![
-                    "\\dt, show tables".to_string(),
-                    "list tables through the strategy layer".to_string(),
-                ],
-                vec![
-                    "\\d table, desc table".to_string(),
-                    "describe a table through the strategy layer".to_string(),
-                ],
-                vec![":refresh".to_string(), "reload metadata".to_string()],
-                vec![
-                    ":safe [on|off|toggle]".to_string(),
-                    "change safe mode".to_string(),
-                ],
-                vec![":quit".to_string(), "exit rdbt".to_string()],
-            ],
-            message: "rdbt commands".to_string(),
-        });
+        self.view = OutputView::Query(menu::help_output());
         self.output_scroll = 0;
         self.status = "help".to_string();
     }
@@ -781,11 +755,7 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let theme = if self.config.safe_mode {
-            Theme::safe()
-        } else {
-            Theme::unsafe_mode()
-        };
+        let theme = ThemeKind::from_safe_mode(self.config.safe_mode).theme();
 
         frame.render_widget(Clear, frame.area());
         frame.render_widget(
@@ -835,7 +805,7 @@ impl App {
                 mode,
                 Style::default().fg(theme.text).bg(theme.accent_dark).bold(),
             ),
-            Span::raw("  F2 mode  F5 refresh  Tab focus  Esc quit"),
+            Span::raw(menu::top_hint(&self.keymap)),
         ]);
         let block = Block::new()
             .borders(Borders::ALL)
@@ -1184,53 +1154,6 @@ impl App {
     }
 }
 
-fn normalize_client_command(command: &str) -> Option<String> {
-    let trimmed = command.trim();
-    if trimmed.starts_with(':') {
-        return Some(trimmed.to_string());
-    }
-
-    match trimmed {
-        "\\q" => return Some(":quit".to_string()),
-        "\\?" => return Some(":help".to_string()),
-        "\\dn" => return Some(":schemas".to_string()),
-        "\\dt" => return Some(":tables".to_string()),
-        _ => {}
-    }
-
-    if let Some(table) = trimmed.strip_prefix("\\d ") {
-        let table = table.trim();
-        if !table.is_empty() {
-            return Some(format!(":describe {table}"));
-        }
-    }
-
-    let without_semicolon = trimmed.trim_end_matches(';').trim();
-    if without_semicolon.eq_ignore_ascii_case("show schemas")
-        || without_semicolon.eq_ignore_ascii_case("show databases")
-    {
-        return Some(":schemas".to_string());
-    }
-
-    if without_semicolon.eq_ignore_ascii_case("show tables") {
-        return Some(":tables".to_string());
-    }
-
-    for prefix in ["describe ", "desc "] {
-        if without_semicolon
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        {
-            let table = without_semicolon[prefix.len()..].trim();
-            if !table.is_empty() {
-                return Some(format!(":describe {table}"));
-            }
-        }
-    }
-
-    None
-}
-
 fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x
         && x < rect.x.saturating_add(rect.width)
@@ -1365,31 +1288,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use ratatui::layout::Rect;
 
-    use super::{PreviewOrder, block_inner, clamp_scroll, contains, normalize_client_command};
-
-    #[test]
-    fn normalizes_psql_table_alias() {
-        assert_eq!(
-            normalize_client_command("\\dt"),
-            Some(":tables".to_string())
-        );
-        assert_eq!(
-            normalize_client_command("\\d public.users"),
-            Some(":describe public.users".to_string())
-        );
-    }
-
-    #[test]
-    fn normalizes_mysql_table_alias() {
-        assert_eq!(
-            normalize_client_command("show tables;"),
-            Some(":tables".to_string())
-        );
-        assert_eq!(
-            normalize_client_command("DESC users;"),
-            Some(":describe users".to_string())
-        );
-    }
+    use super::{PreviewOrder, block_inner, clamp_scroll, contains};
 
     #[test]
     fn clamps_scroll_to_available_rows() {
