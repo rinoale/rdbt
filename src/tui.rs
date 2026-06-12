@@ -3,6 +3,7 @@ use std::{io::stdout, time::Duration};
 mod command;
 mod keymap;
 mod menu;
+mod style;
 mod theme;
 
 use color_eyre::Result;
@@ -16,7 +17,6 @@ use crossterm::{
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
@@ -33,6 +33,7 @@ use crate::{
 use self::{
     command::{RdbtCommand, SafeModeCommand},
     keymap::{Intent, Keymap, text_input_modifiers},
+    style::Role,
     theme::{Theme, ThemeKind},
 };
 
@@ -759,7 +760,7 @@ impl App {
 
         frame.render_widget(Clear, frame.area());
         frame.render_widget(
-            Block::new().style(Style::default().bg(theme.background)),
+            Block::new().style(theme.style(Role::AppBackground)),
             frame.area(),
         );
 
@@ -794,23 +795,17 @@ impl App {
             "UNSAFE"
         };
         let title = Line::from(vec![
-            Span::styled(
-                " rdbt ",
-                Style::default().fg(Color::Black).bg(theme.accent).bold(),
-            ),
+            Span::styled(" rdbt ", theme.style(Role::HeaderBrand)),
             Span::raw(" "),
-            Span::styled(self.strategy.name(), Style::default().fg(theme.text).bold()),
+            Span::styled(self.strategy.name(), theme.style(Role::Header)),
             Span::raw(" "),
-            Span::styled(
-                mode,
-                Style::default().fg(theme.text).bg(theme.accent_dark).bold(),
-            ),
+            Span::styled(mode, theme.style(Role::HeaderMode)),
             Span::raw(menu::top_hint(&self.keymap)),
         ]);
         let block = Block::new()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border))
-            .style(Style::default().bg(theme.panel));
+            .border_style(theme.style(Role::Panel))
+            .style(theme.style(Role::Header));
         frame.render_widget(Paragraph::new(title).block(block), area);
     }
 
@@ -818,7 +813,7 @@ impl App {
         let items = if self.metadata.tables.is_empty() {
             vec![ListItem::new(Line::from(Span::styled(
                 "no tables loaded",
-                Style::default().fg(theme.muted),
+                theme.style(Role::TextMuted),
             )))]
         } else {
             self.metadata
@@ -828,12 +823,12 @@ impl App {
                 .skip(self.browser_scroll)
                 .map(|(index, table)| {
                     let style = if index == self.selected_table {
-                        Style::default().fg(theme.text).bg(theme.selected).bold()
+                        theme.style(Role::ListItemSelected)
                     } else {
-                        Style::default().fg(theme.text)
+                        theme.style(Role::ListItem)
                     };
                     ListItem::new(Line::from(vec![
-                        Span::styled(table.schema.clone(), Style::default().fg(theme.muted)),
+                        Span::styled(table.schema.clone(), theme.selector("browser.schema")),
                         Span::raw("."),
                         Span::styled(table.name.clone(), style),
                     ]))
@@ -852,11 +847,15 @@ impl App {
         let block = Block::new()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border))
-            .style(Style::default().bg(theme.panel));
+            .border_style(if self.focus == Focus::Browser {
+                theme.style(Role::PanelFocused)
+            } else {
+                theme.style(Role::Panel)
+            })
+            .style(theme.style(Role::Panel));
         let list = List::new(items)
             .block(block)
-            .style(Style::default().bg(theme.panel));
+            .style(theme.style(Role::Panel));
 
         frame.render_widget(list, area);
     }
@@ -931,8 +930,8 @@ impl App {
         let block = Block::new()
             .title("Table Preview")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border))
-            .style(Style::default().bg(theme.panel));
+            .border_style(theme.style(Role::Panel))
+            .style(theme.style(Role::Panel));
         frame.render_widget(block, area);
 
         let inner = block_inner(area);
@@ -984,12 +983,20 @@ impl App {
             return;
         }
 
-        let border = if active { theme.accent } else { theme.border };
+        let border = if active {
+            theme.selector("select.active.border")
+        } else {
+            theme.selector("select.border")
+        };
         let block = Block::new()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(border))
-            .style(Style::default().bg(theme.panel));
+            .border_style(border)
+            .style(if active {
+                theme.style(Role::InputFocused)
+            } else {
+                theme.style(Role::Input)
+            });
         let value = format!(
             "{} v",
             truncate(value, area.width.saturating_sub(4) as usize)
@@ -997,7 +1004,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(value)
                 .block(block)
-                .style(Style::default().fg(theme.text).bg(theme.panel)),
+                .style(theme.style(Role::Input)),
             area,
         );
     }
@@ -1036,18 +1043,16 @@ impl App {
         let rect = Rect::new(control.x, control.y + control.height, control.width, height);
         self.layout.dropdown = Some(DropdownArea { kind, rect });
 
-        let list = List::new(items.into_iter().map(|item| {
-            ListItem::new(Line::from(Span::styled(
-                item,
-                Style::default().fg(theme.text).bg(theme.panel),
-            )))
-        }))
-        .block(
-            Block::new()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent))
-                .style(Style::default().bg(theme.panel)),
-        );
+        let list =
+            List::new(items.into_iter().map(|item| {
+                ListItem::new(Line::from(Span::styled(item, theme.style(Role::Text))))
+            }))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(theme.selector("dropdown.border"))
+                    .style(theme.style(Role::Panel)),
+            );
         frame.render_widget(Clear, rect);
         frame.render_widget(list, rect);
     }
@@ -1065,11 +1070,11 @@ impl App {
             let block = Block::new()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border))
-                .style(Style::default().bg(theme.panel));
+                .border_style(theme.style(Role::Panel))
+                .style(theme.style(Role::Panel));
             let paragraph = Paragraph::new(output.message.clone())
                 .block(block)
-                .style(Style::default().fg(theme.text).bg(theme.panel))
+                .style(theme.style(Role::Text))
                 .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
             return;
@@ -1081,36 +1086,38 @@ impl App {
             .copied()
             .map(Constraint::Length)
             .collect::<Vec<_>>();
-        let header = Row::new(output.columns.iter().map(|column| {
-            Cell::from(column.clone())
-                .style(Style::default().fg(Color::Black).bg(theme.accent).bold())
-        }));
-        let rows = output.rows.iter().skip(row_offset).map(|row| {
-            Row::new(row.iter().map(|value| {
-                Cell::from(truncate(value, 64))
-                    .style(Style::default().fg(theme.text).bg(theme.panel))
-            }))
-        });
+        let header = Row::new(
+            output
+                .columns
+                .iter()
+                .map(|column| Cell::from(column.clone()).style(theme.style(Role::TableHeader))),
+        );
+        let rows =
+            output.rows.iter().skip(row_offset).map(|row| {
+                Row::new(row.iter().map(|value| {
+                    Cell::from(truncate(value, 64)).style(theme.style(Role::TableCell))
+                }))
+            });
         let table = Table::new(rows, constraints)
             .header(header)
             .block(
                 Block::new()
                     .title(format!("{title} - {}", output.message))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.border))
-                    .style(Style::default().bg(theme.panel)),
+                    .border_style(theme.style(Role::Panel))
+                    .style(theme.style(Role::Panel)),
             )
             .column_spacing(1)
-            .style(Style::default().bg(theme.panel));
+            .style(theme.style(Role::Panel));
 
         frame.render_widget(table, area);
     }
 
     fn render_prompt(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let status_style = if self.config.safe_mode {
-            Style::default().fg(theme.muted)
+            theme.style(Role::Status)
         } else {
-            Style::default().fg(theme.danger).bold()
+            theme.style(Role::StatusDanger)
         };
         let title = format!(
             "SQL {}",
@@ -1123,9 +1130,9 @@ impl App {
         let prompt = Line::from(vec![
             Span::styled(
                 format!("{}> ", self.config.dbms),
-                Style::default().fg(theme.accent).bold(),
+                theme.style(Role::PromptPrefix),
             ),
-            Span::styled(self.input.clone(), Style::default().fg(theme.text)),
+            Span::styled(self.input.clone(), theme.style(Role::PromptInput)),
         ]);
         let footer = Line::from(vec![
             Span::styled(self.status.clone(), status_style),
@@ -1136,19 +1143,23 @@ impl App {
                 } else {
                     "writes allowed"
                 },
-                Style::default().fg(theme.text).bg(theme.accent_dark),
+                theme.style(Role::Badge),
             ),
         ]);
         let text = vec![prompt, footer];
         let block = Block::new()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border))
-            .style(Style::default().bg(theme.panel));
+            .border_style(if self.focus == Focus::Prompt {
+                theme.style(Role::PanelFocused)
+            } else {
+                theme.style(Role::Panel)
+            })
+            .style(theme.style(Role::Panel));
         frame.render_widget(
             Paragraph::new(text)
                 .block(block)
-                .style(Style::default().fg(theme.text).bg(theme.panel)),
+                .style(theme.style(Role::Footer)),
             area,
         );
     }

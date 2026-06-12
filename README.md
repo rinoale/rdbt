@@ -103,5 +103,6 @@ Compatibility aliases are routed through the same strategy layer:
 - `src/tui/keymap.rs`: unified key-to-intent mapping; no quit keybinding
 - `src/tui/command.rs`: command-mode parser and database-client aliases
 - `src/tui/menu.rs`: top hints and command help output
+- `src/tui/style.rs`: design tokens, selectors, and style-rule DSL
 - `src/tui/theme.rs`: safe/unsafe theme color roles
 - `src/tui.rs`: rdbt-specific application state, database actions, and rendering
