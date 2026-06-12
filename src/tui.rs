@@ -3,8 +3,8 @@ use std::{io::stdout, time::Duration};
 mod command;
 mod keymap;
 mod menu;
-mod style;
-mod theme;
+pub(crate) mod style;
+pub(crate) mod theme;
 
 use color_eyre::Result;
 use crossterm::{

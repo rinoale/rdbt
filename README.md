@@ -31,9 +31,11 @@ Start onboarding prompts:
 rdbt
 ```
 
-The onboarding flow asks for connector, host, port, user, password, and optional
-schema/database before the TUI starts. Paste works in these prompts, including
-the hidden password entry.
+The onboarding flow opens a TUI login form. It lets you select PostgreSQL or
+MySQL, choose a default host (`localhost`, `127.0.0.1`, or manual input), and
+enter host, port, user, and password as one connection set. Paste works in text
+fields, including password. Schema/database selection happens in the browser
+after connecting, not as startup typing.
 
 Connect with a URL:
 

@@ -1,5 +1,6 @@
 mod args;
 mod database;
+mod onboarding;
 mod safety;
 mod tui;
 
@@ -12,7 +13,9 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     let cli = Cli::parse();
-    let config = cli.into_config()?;
+    let Some(config) = cli.into_config()? else {
+        return Ok(());
+    };
     let client = database::DatabaseClient::connect(&config).await?;
     let app = tui::App::new(config, client);
 

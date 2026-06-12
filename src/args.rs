@@ -1,11 +1,10 @@
-use std::{
-    fmt,
-    io::{self, Write},
-};
+use std::fmt;
 
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Result, eyre};
 use url::Url;
+
+use crate::onboarding::{OnboardingDefaults, run_onboarding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Dbms {
@@ -59,7 +58,7 @@ pub struct Cli {
 }
 
 impl Cli {
-    pub fn into_config(self) -> Result<Config> {
+    pub fn into_config(self) -> Result<Option<Config>> {
         let safe_mode = !self.unsafe_mode;
 
         if let Some(url) = self.url {
@@ -67,56 +66,27 @@ impl Cli {
                 .dbms
                 .or_else(|| dbms_from_url(&url))
                 .ok_or_else(|| eyre!("could not infer database connector from URL"))?;
-            return Ok(Config {
+            return Ok(Some(Config {
                 dbms,
                 url,
                 database: self.database,
                 safe_mode,
-            });
+            }));
         }
 
-        let dbms = match self.dbms {
-            Some(dbms) => dbms,
-            None => prompt_dbms()?,
-        };
-        let host = prompt_with_default("Host", &self.host)?;
-        let port = match self.port {
-            Some(port) => port,
-            None => prompt_port(dbms)?,
-        };
-        let user = match self.user {
-            Some(user) => user,
-            None => prompt_required("User")?,
-        };
-        let password = match self.password {
-            Some(password) if password.is_empty() => Some(prompt_password_optional()?),
-            Some(password) => Some(password),
-            None => prompt_password_optional().map(Some)?,
-        }
-        .filter(|password| !password.is_empty());
-        let database = match self.database {
-            Some(database) => Some(database),
-            None => prompt_optional("Schema/database (optional)")?,
-        };
-        let url = build_url(
-            dbms,
-            &host,
-            port,
-            Some(user.as_str()),
-            password,
-            database.as_deref(),
-        )?;
-
-        Ok(Config {
-            dbms,
-            url,
-            database,
+        run_onboarding(OnboardingDefaults {
+            dbms: self.dbms.unwrap_or(Dbms::Postgres),
+            host: self.host,
+            port: self.port,
+            user: self.user.unwrap_or_default(),
+            password: self.password.unwrap_or_default(),
+            database: self.database,
             safe_mode,
         })
     }
 }
 
-fn default_port(dbms: Dbms) -> u16 {
+pub(crate) fn default_port(dbms: Dbms) -> u16 {
     match dbms {
         Dbms::Postgres => 5432,
         Dbms::Mysql => 3306,
@@ -132,69 +102,7 @@ fn dbms_from_url(url: &str) -> Option<Dbms> {
     }
 }
 
-fn prompt_dbms() -> Result<Dbms> {
-    loop {
-        let input = prompt_with_default("Connector [postgres/mysql]", "postgres")?;
-        match input.trim().to_ascii_lowercase().as_str() {
-            "1" | "pg" | "postgres" | "postgresql" => return Ok(Dbms::Postgres),
-            "2" | "my" | "mysql" | "mariadb" => return Ok(Dbms::Mysql),
-            _ => eprintln!("Please enter postgres or mysql."),
-        }
-    }
-}
-
-fn prompt_port(dbms: Dbms) -> Result<u16> {
-    loop {
-        let default = default_port(dbms).to_string();
-        let input = prompt_with_default("Port", &default)?;
-        match input.parse::<u16>() {
-            Ok(port) => return Ok(port),
-            Err(_) => eprintln!("Please enter a valid TCP port."),
-        }
-    }
-}
-
-fn prompt_required(label: &str) -> Result<String> {
-    loop {
-        let input = prompt(label)?;
-        if !input.trim().is_empty() {
-            return Ok(input);
-        }
-        eprintln!("{label} is required.");
-    }
-}
-
-fn prompt_optional(label: &str) -> Result<Option<String>> {
-    let input = prompt(label)?;
-    if input.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(input))
-    }
-}
-
-fn prompt_with_default(label: &str, default: &str) -> Result<String> {
-    let input = prompt(&format!("{label} [{default}]"))?;
-    if input.trim().is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(input)
-    }
-}
-
-fn prompt(label: &str) -> Result<String> {
-    print!("{label}: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
-}
-
-fn prompt_password_optional() -> Result<String> {
-    rpassword::prompt_password("Password (optional): ").map_err(Into::into)
-}
-
-fn build_url(
+pub(crate) fn build_url(
     dbms: Dbms,
     host: &str,
     port: u16,
@@ -213,12 +121,6 @@ fn build_url(
         url.set_username(user)
             .map_err(|_| eyre!("invalid database user"))?;
     }
-
-    let password = match password {
-        Some(password) if password.is_empty() => Some(rpassword::prompt_password("Password: ")?),
-        Some(password) => Some(password),
-        None => None,
-    };
 
     if let Some(password) = password {
         url.set_password(Some(&password))
