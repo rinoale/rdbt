@@ -3,7 +3,6 @@ use std::{io::stdout, time::Duration};
 mod command;
 mod keymap;
 mod menu;
-pub(crate) mod style;
 pub(crate) mod theme;
 
 use color_eyre::Result;
@@ -20,6 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
+use rustui::style::Role;
 
 use crate::{
     args::Config,
@@ -33,7 +33,6 @@ use crate::{
 use self::{
     command::{RdbtCommand, SafeModeCommand},
     keymap::{Intent, Keymap, text_input_modifiers},
-    style::Role,
     theme::{Theme, ThemeKind},
 };
 

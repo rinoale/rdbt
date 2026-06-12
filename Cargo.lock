@@ -1844,6 +1844,7 @@ dependencies = [
  "crossterm",
  "pretty_assertions",
  "ratatui",
+ "rustui",
  "sqlx",
  "tokio",
  "url",
@@ -1990,6 +1991,16 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "untrusted",
+]
+
+[[package]]
+name = "rustui"
+version = "0.1.0"
+source = "git+ssh://git@github.com/rinoale/rustui.git?tag=v0.1.0#639761981044bcd02bb4d79c71d8f4ed32f029e8"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "tokio",
 ]
 
 [[package]]

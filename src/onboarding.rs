@@ -14,15 +14,13 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use rustui::style::Role;
 use tokio::time::timeout;
 
 use crate::{
     args::{Config, Dbms, build_url, default_port},
     database::DatabaseClient,
-    tui::{
-        style::Role,
-        theme::{Theme, ThemeKind},
-    },
+    tui::theme::{Theme, ThemeKind},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

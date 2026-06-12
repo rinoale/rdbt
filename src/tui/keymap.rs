@@ -1,4 +1,7 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyModifiers};
+use rustui::keymap::{KeyBinding as FrameworkKeyBinding, Keymap as FrameworkKeymap, binding};
+
+pub use rustui::keymap::{Key, text_input_modifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
@@ -13,35 +16,11 @@ pub enum Intent {
     Next,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Key {
-    Char(char),
-    Esc,
-    F(u8),
-    Enter,
-    Tab,
-    BackTab,
-    Up,
-    Down,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyPattern {
-    pub key: Key,
-    pub modifiers: KeyModifiers,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyBinding {
-    pub pattern: KeyPattern,
-    pub intent: Intent,
-    pub label: &'static str,
-    pub description: &'static str,
-}
+pub type KeyBinding = FrameworkKeyBinding<Intent>;
 
 #[derive(Debug, Clone)]
 pub struct Keymap {
-    bindings: Vec<KeyBinding>,
+    inner: FrameworkKeymap<Intent>,
 }
 
 impl Default for Keymap {
@@ -54,7 +33,7 @@ impl Keymap {
     pub fn rdbt() -> Self {
         let none = KeyModifiers::NONE;
         Self {
-            bindings: vec![
+            inner: FrameworkKeymap::new(vec![
                 binding(
                     Key::Char(':'),
                     none,
@@ -77,65 +56,17 @@ impl Keymap {
                 binding(Key::Enter, none, Intent::Submit, "Enter", "run/open"),
                 binding(Key::Up, none, Intent::Previous, "Up", "previous"),
                 binding(Key::Down, none, Intent::Next, "Down", "next"),
-            ],
+            ]),
         }
     }
 
     pub fn intent_for(&self, key: KeyEvent) -> Option<Intent> {
-        self.bindings
-            .iter()
-            .find(|binding| binding.pattern.matches(key))
-            .map(|binding| binding.intent)
+        self.inner.intent_for(key)
     }
 
     pub fn bindings(&self) -> &[KeyBinding] {
-        &self.bindings
+        self.inner.bindings()
     }
-}
-
-pub fn binding(
-    key: Key,
-    modifiers: KeyModifiers,
-    intent: Intent,
-    label: &'static str,
-    description: &'static str,
-) -> KeyBinding {
-    KeyBinding {
-        pattern: KeyPattern { key, modifiers },
-        intent,
-        label,
-        description,
-    }
-}
-
-impl KeyPattern {
-    fn matches(self, event: KeyEvent) -> bool {
-        key_matches(self.key, event.code) && normalized_modifiers(event.modifiers) == self.modifiers
-    }
-}
-
-pub fn text_input_modifiers(mut modifiers: KeyModifiers) -> bool {
-    modifiers.remove(KeyModifiers::SHIFT);
-    modifiers.is_empty()
-}
-
-fn key_matches(expected: Key, actual: KeyCode) -> bool {
-    match (expected, actual) {
-        (Key::Char(expected), KeyCode::Char(actual)) => expected == actual,
-        (Key::Esc, KeyCode::Esc) => true,
-        (Key::F(expected), KeyCode::F(actual)) => expected == actual,
-        (Key::Enter, KeyCode::Enter) => true,
-        (Key::Tab, KeyCode::Tab) => true,
-        (Key::BackTab, KeyCode::BackTab) => true,
-        (Key::Up, KeyCode::Up) => true,
-        (Key::Down, KeyCode::Down) => true,
-        _ => false,
-    }
-}
-
-fn normalized_modifiers(mut modifiers: KeyModifiers) -> KeyModifiers {
-    modifiers.remove(KeyModifiers::SHIFT);
-    modifiers
 }
 
 #[cfg(test)]

@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 
 use ratatui::style::{Color, Style};
-
-use super::style::{ColorToken, Design, Palette, Role, style};
+use rustui::style::{ColorToken, Design, Palette, Role, style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKind {
