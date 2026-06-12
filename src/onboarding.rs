@@ -14,14 +14,18 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use tokio::time::timeout;
 
 use crate::{
     args::{Config, Dbms, build_url, default_port},
+    database::DatabaseClient,
     tui::{
         style::Role,
         theme::{Theme, ThemeKind},
     },
 };
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct OnboardingDefaults {
@@ -34,14 +38,16 @@ pub struct OnboardingDefaults {
     pub safe_mode: bool,
 }
 
-pub fn run_onboarding(defaults: OnboardingDefaults) -> Result<Option<Config>> {
+pub async fn run_onboarding(
+    defaults: OnboardingDefaults,
+) -> Result<Option<(Config, DatabaseClient)>> {
     let mut terminal = ratatui::init();
     if let Err(error) = execute!(stdout(), EnableBracketedPaste) {
         ratatui::restore();
         return Err(error.into());
     }
 
-    let result = OnboardingApp::new(defaults).run(&mut terminal);
+    let result = OnboardingApp::new(defaults).run(&mut terminal).await;
     let disable_result = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
     disable_result?;
@@ -55,6 +61,12 @@ enum Field {
     Port,
     User,
     Password,
+    Connect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormAction {
+    Continue,
     Connect,
 }
 
@@ -146,7 +158,7 @@ struct OnboardingApp {
     command_mode: bool,
     command_input: String,
     status: String,
-    result: Option<Option<Config>>,
+    canceled: bool,
 }
 
 impl OnboardingApp {
@@ -175,30 +187,39 @@ impl OnboardingApp {
             command_mode: false,
             command_input: String::new(),
             status: "choose connector and connection settings".to_string(),
-            result: None,
+            canceled: false,
         }
     }
 
-    fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Config>> {
-        while self.result.is_none() {
+    async fn run(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<Option<(Config, DatabaseClient)>> {
+        while !self.canceled {
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if self.handle_key(key) == FormAction::Connect {
+                            terminal.draw(|frame| self.render(frame))?;
+                            if let Some(connection) = self.connect().await? {
+                                return Ok(Some(connection));
+                            }
+                        }
+                    }
                     Event::Paste(text) => self.append_text(&text),
                     _ => {}
                 }
             }
         }
 
-        Ok(self.result.take().flatten())
+        Ok(None)
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent) -> FormAction {
         if self.command_mode {
-            self.handle_command_key(key);
-            return;
+            return self.handle_command_key(key);
         }
 
         match key.code {
@@ -208,19 +229,21 @@ impl OnboardingApp {
             KeyCode::BackTab | KeyCode::Up => self.focus = self.focus.previous(),
             KeyCode::Left => self.choose_previous(),
             KeyCode::Right => self.choose_next(),
-            KeyCode::Enter => self.enter_or_advance(),
+            KeyCode::Enter => return self.enter_or_advance(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Char(character) if text_input_modifiers(key.modifiers) => {
                 self.append_char(character)
             }
             _ => {}
         }
+
+        FormAction::Continue
     }
 
-    fn handle_command_key(&mut self, key: KeyEvent) {
+    fn handle_command_key(&mut self, key: KeyEvent) -> FormAction {
         match key.code {
             KeyCode::Esc => self.cancel_command(),
-            KeyCode::Enter => self.submit_command(),
+            KeyCode::Enter => return self.submit_command(),
             KeyCode::Backspace => {
                 self.command_input.pop();
             }
@@ -229,6 +252,8 @@ impl OnboardingApp {
             }
             _ => {}
         }
+
+        FormAction::Continue
     }
 
     fn enter_command_mode(&mut self) {
@@ -244,10 +269,10 @@ impl OnboardingApp {
         self.status = "command canceled".to_string();
     }
 
-    fn submit_command(&mut self) {
+    fn submit_command(&mut self) -> FormAction {
         match self.command_input.trim() {
             ":q" | ":quit" | ":exit" | ":q!" | ":quit!" | ":exit!" => {
-                self.result = Some(None);
+                self.canceled = true;
             }
             ":help" | ":?" => {
                 self.status =
@@ -259,6 +284,7 @@ impl OnboardingApp {
 
         self.command_mode = false;
         self.command_input.clear();
+        FormAction::Continue
     }
 
     fn choose_next(&mut self) {
@@ -290,18 +316,13 @@ impl OnboardingApp {
         }
     }
 
-    fn enter_or_advance(&mut self) {
+    fn enter_or_advance(&mut self) -> FormAction {
         if self.focus == Field::Connect {
-            self.submit();
+            self.status = "connecting...".to_string();
+            FormAction::Connect
         } else {
             self.focus = self.focus.next();
-        }
-    }
-
-    fn submit(&mut self) {
-        match self.to_config() {
-            Ok(config) => self.result = Some(Some(config)),
-            Err(message) => self.status = message,
+            FormAction::Continue
         }
     }
 
@@ -339,6 +360,31 @@ impl OnboardingApp {
             database: self.database.clone(),
             safe_mode: self.safe_mode,
         })
+    }
+
+    async fn connect(&mut self) -> Result<Option<(Config, DatabaseClient)>> {
+        let config = match self.to_config() {
+            Ok(config) => config,
+            Err(message) => {
+                self.status = message;
+                return Ok(None);
+            }
+        };
+
+        self.status = format!("connecting to {}...", connection_label(&config));
+        match timeout(CONNECT_TIMEOUT, DatabaseClient::connect(&config)).await {
+            Ok(Ok(client)) => Ok(Some((config, client))),
+            Ok(Err(error)) => {
+                self.status = format!("connection failed: {error}");
+                self.focus = Field::Connect;
+                Ok(None)
+            }
+            Err(_) => {
+                self.status = format!("connection timed out after {}s", CONNECT_TIMEOUT.as_secs());
+                self.focus = Field::Connect;
+                Ok(None)
+            }
+        }
     }
 
     fn backspace(&mut self) {
@@ -562,6 +608,13 @@ impl OnboardingApp {
             theme.style(Role::Text)
         };
         Span::styled(value, style)
+    }
+}
+
+fn connection_label(config: &Config) -> &'static str {
+    match config.dbms {
+        Dbms::Postgres => "postgres",
+        Dbms::Mysql => "mysql",
     }
 }
 

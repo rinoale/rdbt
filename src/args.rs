@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Result, eyre};
 use url::Url;
 
-use crate::onboarding::{OnboardingDefaults, run_onboarding};
+use crate::onboarding::OnboardingDefaults;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Dbms {
@@ -27,6 +27,11 @@ pub struct Config {
     pub url: String,
     pub database: Option<String>,
     pub safe_mode: bool,
+}
+
+pub enum Startup {
+    Direct(Config),
+    Onboarding(OnboardingDefaults),
 }
 
 #[derive(Debug, Parser)]
@@ -58,7 +63,7 @@ pub struct Cli {
 }
 
 impl Cli {
-    pub fn into_config(self) -> Result<Option<Config>> {
+    pub fn into_startup(self) -> Result<Startup> {
         let safe_mode = !self.unsafe_mode;
 
         if let Some(url) = self.url {
@@ -66,7 +71,7 @@ impl Cli {
                 .dbms
                 .or_else(|| dbms_from_url(&url))
                 .ok_or_else(|| eyre!("could not infer database connector from URL"))?;
-            return Ok(Some(Config {
+            return Ok(Startup::Direct(Config {
                 dbms,
                 url,
                 database: self.database,
@@ -74,7 +79,7 @@ impl Cli {
             }));
         }
 
-        run_onboarding(OnboardingDefaults {
+        Ok(Startup::Onboarding(OnboardingDefaults {
             dbms: self.dbms.unwrap_or(Dbms::Postgres),
             host: self.host,
             port: self.port,
@@ -82,7 +87,7 @@ impl Cli {
             password: self.password.unwrap_or_default(),
             database: self.database,
             safe_mode,
-        })
+        }))
     }
 }
 
