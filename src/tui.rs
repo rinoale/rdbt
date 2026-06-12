@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
 use rustui::{runtime::spawn_event_reader, style::Role};
-use tokio::time;
+use tokio::{sync::mpsc, time};
 
 use crate::{
     args::Config,
@@ -41,6 +41,8 @@ const COMMAND_SAMPLE_LIMIT: u16 = 100;
 const DEFAULT_PREVIEW_LIMIT: u16 = 10;
 const LIMIT_OPTIONS: &[u16] = &[10, 25, 50, 100];
 const SCROLL_STEP: isize = 3;
+
+type TaskResult<T> = std::result::Result<T, String>;
 
 pub async fn run(mut app: App) -> Result<()> {
     let mut terminal = ratatui::init();
@@ -167,6 +169,24 @@ impl Default for UiLayout {
     }
 }
 
+enum AppEvent {
+    MetadataLoaded {
+        task_id: u64,
+        schemas: TaskResult<QueryOutput>,
+        tables: TaskResult<QueryOutput>,
+    },
+    QueryFinished {
+        task_id: u64,
+        result: TaskResult<QueryOutput>,
+        success_status: String,
+        failure_status: String,
+    },
+    TableDetailLoaded {
+        task_id: u64,
+        result: TaskResult<TableDetail>,
+    },
+}
+
 pub struct App {
     config: Config,
     client: DatabaseClient,
@@ -185,6 +205,11 @@ pub struct App {
     active_dropdown: Option<DropdownKind>,
     layout: UiLayout,
     keymap: Keymap,
+    task_tx: mpsc::UnboundedSender<AppEvent>,
+    task_rx: mpsc::UnboundedReceiver<AppEvent>,
+    next_task_id: u64,
+    active_view_task: Option<u64>,
+    metadata_task: Option<u64>,
     should_quit: bool,
 }
 
@@ -195,6 +220,7 @@ impl App {
             .database
             .clone()
             .unwrap_or_else(|| "database".to_string());
+        let (task_tx, task_rx) = mpsc::unbounded_channel();
         Self {
             config,
             client,
@@ -213,25 +239,31 @@ impl App {
             active_dropdown: None,
             layout: UiLayout::default(),
             keymap: Keymap::default(),
+            task_tx,
+            task_rx,
+            next_task_id: 0,
+            active_view_task: None,
+            metadata_task: None,
             should_quit: false,
         }
     }
 
     async fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-        self.load_metadata_if_needed().await;
+        self.load_metadata_if_needed();
         let mut events = spawn_event_reader();
         let mut tick = time::interval(Duration::from_millis(100));
 
         while !self.should_quit {
+            self.poll_task_events();
             terminal.draw(|frame| self.render(frame))?;
 
             tokio::select! {
                 maybe_event = events.recv() => {
                     match maybe_event {
                         Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                            self.handle_key(key).await;
+                            self.handle_key(key);
                         }
-                        Some(Event::Mouse(mouse)) => self.handle_mouse(mouse).await,
+                        Some(Event::Mouse(mouse)) => self.handle_mouse(mouse),
                         Some(_) => {}
                         None => break,
                     }
@@ -243,13 +275,13 @@ impl App {
         Ok(())
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent) {
         if self.handle_prompt_text_key(key) {
             return;
         }
 
         if let Some(intent) = self.keymap.intent_for(key) {
-            self.handle_intent(intent).await;
+            self.handle_intent(intent);
         }
     }
 
@@ -272,15 +304,15 @@ impl App {
         }
     }
 
-    async fn handle_intent(&mut self, intent: Intent) {
+    fn handle_intent(&mut self, intent: Intent) {
         match intent {
             Intent::EnterCommandMode => self.enter_command_mode(),
             Intent::Cancel => self.cancel_transient_input(),
             Intent::Help => self.show_help(),
             Intent::ToggleSafeMode => self.toggle_safe_mode(),
-            Intent::RefreshMetadata => self.refresh_metadata().await,
+            Intent::RefreshMetadata => self.refresh_metadata(),
             Intent::ToggleFocus => self.toggle_focus(),
-            Intent::Submit => self.submit().await,
+            Intent::Submit => self.submit(),
             Intent::Previous => self.move_up(),
             Intent::Next => self.move_down(),
         }
@@ -316,12 +348,12 @@ impl App {
         self.input.push(':');
     }
 
-    async fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, -SCROLL_STEP),
             MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, SCROLL_STEP),
             MouseEventKind::Down(MouseButton::Left) => {
-                self.click_at(mouse.column, mouse.row).await;
+                self.click_at(mouse.column, mouse.row);
             }
             _ => {}
         }
@@ -347,11 +379,11 @@ impl App {
         }
     }
 
-    async fn click_at(&mut self, x: u16, y: u16) {
+    fn click_at(&mut self, x: u16, y: u16) {
         if let Some(dropdown) = self.layout.dropdown
             && contains(dropdown.rect, x, y)
         {
-            self.select_dropdown_value(dropdown.kind, y).await;
+            self.select_dropdown_value(dropdown.kind, y);
             return;
         }
 
@@ -374,7 +406,7 @@ impl App {
             let index = self.browser_scroll + row;
             if let Some(table) = self.metadata.tables.get(index).cloned() {
                 self.selected_table = index;
-                self.load_table_detail(&table).await;
+                self.load_table_detail(&table);
             }
             return;
         }
@@ -384,7 +416,7 @@ impl App {
         }
     }
 
-    async fn select_dropdown_value(&mut self, kind: DropdownKind, y: u16) {
+    fn select_dropdown_value(&mut self, kind: DropdownKind, y: u16) {
         let Some(dropdown) = self.layout.dropdown else {
             return;
         };
@@ -414,7 +446,7 @@ impl App {
         self.active_dropdown = None;
         if let OutputView::Detail(detail) = &self.view {
             let table = detail.table.clone();
-            self.load_table_detail(&table).await;
+            self.load_table_detail(&table);
         }
     }
 
@@ -462,11 +494,11 @@ impl App {
         }
     }
 
-    async fn submit(&mut self) {
+    fn submit(&mut self) {
         let command = self.input.trim().to_string();
         if command.is_empty() {
             if let Some(table) = self.metadata.tables.get(self.selected_table).cloned() {
-                self.load_table_detail(&table).await;
+                self.load_table_detail(&table);
             }
             return;
         }
@@ -476,13 +508,13 @@ impl App {
         self.input.clear();
 
         if let Some(command) = command::normalize_client_command(&command) {
-            self.run_rdbt_command(&command).await;
+            self.run_rdbt_command(&command);
         } else {
-            self.run_sql(&command).await;
+            self.run_sql(&command);
         }
     }
 
-    async fn run_rdbt_command(&mut self, command: &str) {
+    fn run_rdbt_command(&mut self, command: &str) {
         match command::parse(command) {
             RdbtCommand::Quit { force: _ } => self.should_quit = true,
             RdbtCommand::Help => self.show_help(),
@@ -490,26 +522,24 @@ impl App {
             RdbtCommand::Safe(SafeModeCommand::On) => self.set_safe_mode(true),
             RdbtCommand::Safe(SafeModeCommand::Toggle) => self.toggle_safe_mode(),
             RdbtCommand::Unsafe => self.set_safe_mode(false),
-            RdbtCommand::Refresh => self.refresh_metadata().await,
+            RdbtCommand::Refresh => self.refresh_metadata(),
             RdbtCommand::Schemas => {
-                self.run_strategy_query(self.strategy.list_schemas_sql(), "schemas")
-                    .await
+                self.run_strategy_query(self.strategy.list_schemas_sql(), "schemas");
             }
             RdbtCommand::Tables => {
-                self.run_strategy_query(self.strategy.list_tables_sql(), "tables")
-                    .await
+                self.run_strategy_query(self.strategy.list_tables_sql(), "tables");
             }
             RdbtCommand::Describe(table_name) => {
                 if let Some(table) = self.resolve_table(table_name.as_deref()) {
                     let sql = self.strategy.describe_table_sql(&table);
-                    self.run_strategy_query(sql, "describe").await;
+                    self.run_strategy_query(sql, "describe");
                 } else {
                     self.status = "usage: :describe schema.table".to_string();
                 }
             }
             RdbtCommand::Sample(table_name) => {
                 if let Some(table) = self.resolve_table(table_name.as_deref()) {
-                    self.sample_table(&table).await;
+                    self.sample_table(&table);
                 } else {
                     self.status = "usage: :sample schema.table".to_string();
                 }
@@ -525,7 +555,7 @@ impl App {
         }
     }
 
-    async fn run_sql(&mut self, sql: &str) {
+    fn run_sql(&mut self, sql: &str) {
         if self.config.safe_mode {
             let decision = safety::classify(sql);
             if !decision.is_allowed() {
@@ -538,122 +568,144 @@ impl App {
             }
         }
 
-        self.status = "running SQL".to_string();
-        let result = if safety::returns_rows(sql) {
-            self.client.query(sql).await
-        } else {
-            self.client.execute(sql).await
-        };
+        let task_id = self.next_task_id();
+        self.active_view_task = Some(task_id);
+        self.status = "running SQL in background".to_string();
+        self.view = OutputView::message("Running SQL...");
 
-        self.set_output_result(result, "SQL complete");
+        let client = self.client.clone();
+        let sql = sql.to_string();
+        let returns_rows = safety::returns_rows(&sql);
+        let sender = self.task_tx.clone();
+        tokio::spawn(async move {
+            let result = if returns_rows {
+                client.query(&sql).await
+            } else {
+                client.execute(&sql).await
+            }
+            .map_err(|error| error.to_string());
+
+            let _ = sender.send(AppEvent::QueryFinished {
+                task_id,
+                result,
+                success_status: "SQL complete".to_string(),
+                failure_status: "SQL failed".to_string(),
+            });
+        });
     }
 
-    async fn run_strategy_query(&mut self, sql: String, label: &str) {
-        self.status = format!("running {label}");
-        let result = self.client.query(&sql).await;
-        self.set_output_result(result, label);
+    fn run_strategy_query(&mut self, sql: String, label: &str) {
+        let task_id = self.next_task_id();
+        self.active_view_task = Some(task_id);
+        self.status = format!("running {label} in background");
+        self.view = OutputView::message(format!("Running {label}..."));
+
+        let client = self.client.clone();
+        let label = label.to_string();
+        let sender = self.task_tx.clone();
+        tokio::spawn(async move {
+            let result = client.query(&sql).await.map_err(|error| error.to_string());
+
+            let _ = sender.send(AppEvent::QueryFinished {
+                task_id,
+                result,
+                success_status: label,
+                failure_status: "SQL failed".to_string(),
+            });
+        });
     }
 
-    async fn sample_table(&mut self, table: &TableRef) {
+    fn sample_table(&mut self, table: &TableRef) {
         let sql = self
             .strategy
             .sample_rows_sql(table, COMMAND_SAMPLE_LIMIT, &SampleOrder::Natural);
-        self.run_strategy_query(sql, &format!("sample {}", table.display_name()))
-            .await;
+        self.run_strategy_query(sql, &format!("sample {}", table.display_name()));
     }
 
-    async fn load_table_detail(&mut self, table: &TableRef) {
+    fn load_table_detail(&mut self, table: &TableRef) {
         // Mouse-driven table inspection is deliberately read-only: it only runs
         // metadata SELECTs and SELECT samples built by the database strategy.
-        self.status = format!("loading {}", table.display_name());
+        let task_id = self.next_task_id();
+        self.active_view_task = Some(task_id);
+        self.status = format!("loading {} in background", table.display_name());
+        self.view = OutputView::message(format!("Loading {}...", table.display_name()));
         self.output_scroll = 0;
 
-        let columns = match self
-            .client
-            .query(&self.strategy.describe_table_sql(table))
-            .await
-        {
-            Ok(columns) => columns,
-            Err(error) => {
-                self.view = OutputView::message(error.to_string());
-                self.status = "describe failed".to_string();
-                return;
-            }
-        };
+        let client = self.client.clone();
+        let dbms = self.config.dbms;
+        let table = table.clone();
+        let options = self.preview_options;
+        let sender = self.task_tx.clone();
+        tokio::spawn(async move {
+            let strategy = strategy_for(dbms);
+            let result = async {
+                let columns = client
+                    .query(&strategy.describe_table_sql(&table))
+                    .await
+                    .map_err(|error| format!("describe failed: {error}"))?;
 
-        let order_column = first_column_name(&columns);
-        let order_label = self.preview_options.order.label(order_column.as_deref());
-        let order = self
-            .preview_options
-            .order
-            .to_sample_order(order_column.as_deref());
-        let rows_sql = self
-            .strategy
-            .sample_rows_sql(table, self.preview_options.limit, &order);
-        let rows = self.client.query(&rows_sql).await;
+                let order_column = first_column_name(&columns);
+                let order = options.order.to_sample_order(order_column.as_deref());
+                let rows_sql = strategy.sample_rows_sql(&table, options.limit, &order);
+                let rows = client
+                    .query(&rows_sql)
+                    .await
+                    .map_err(|error| format!("sample failed: {error}"))?;
 
-        match rows {
-            Ok(rows) => {
-                self.view = OutputView::Detail(TableDetail {
-                    table: table.clone(),
+                Ok(TableDetail {
+                    table,
                     columns,
                     rows,
                     order_column,
-                    options: self.preview_options,
-                });
-                self.status = format!(
-                    "{} preview: {} row limit, {} order",
-                    table.display_name(),
-                    self.preview_options.limit,
-                    order_label
-                );
+                    options,
+                })
             }
-            Err(error) => {
-                self.view = OutputView::message(error.to_string());
-                self.status = "sample failed".to_string();
-            }
-        }
+            .await;
+
+            let _ = sender.send(AppEvent::TableDetailLoaded { task_id, result });
+        });
     }
 
-    async fn refresh_metadata(&mut self) {
+    fn refresh_metadata(&mut self) {
         self.metadata.loaded = false;
         self.metadata.schemas.clear();
         self.metadata.tables.clear();
         self.browser_scroll = 0;
         self.output_scroll = 0;
         self.view = OutputView::message("Refreshing metadata...");
-        self.load_metadata_if_needed().await;
+        self.load_metadata_if_needed();
     }
 
-    async fn load_metadata_if_needed(&mut self) {
+    fn load_metadata_if_needed(&mut self) {
         if self.metadata.loaded {
             return;
         }
 
-        let schemas = self.client.query(&self.strategy.list_schemas_sql()).await;
-        let tables = self.client.query(&self.strategy.list_tables_sql()).await;
+        let task_id = self.next_task_id();
+        self.active_view_task = Some(task_id);
+        self.metadata_task = Some(task_id);
+        self.status = "loading metadata in background".to_string();
 
-        match (schemas, tables) {
-            (Ok(schemas), Ok(tables)) => {
-                self.metadata.schemas = rows_by_column(&schemas, "schema");
-                self.metadata.tables = table_refs(&tables);
-                self.metadata.loaded = true;
-                self.selected_table = self
-                    .selected_table
-                    .min(self.metadata.tables.len().saturating_sub(1));
-                self.view = OutputView::Query(tables);
-                self.output_scroll = 0;
-                self.status = format!(
-                    "loaded {} schema(s), {} table(s)",
-                    self.metadata.schemas.len(),
-                    self.metadata.tables.len()
-                );
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                self.view = OutputView::message(format!("metadata load failed: {error}"));
-                self.status = "metadata load failed".to_string();
-            }
-        }
+        let client = self.client.clone();
+        let dbms = self.config.dbms;
+        let sender = self.task_tx.clone();
+        tokio::spawn(async move {
+            let strategy = strategy_for(dbms);
+            let schemas = client
+                .query(&strategy.list_schemas_sql())
+                .await
+                .map_err(|error| error.to_string());
+            let tables = client
+                .query(&strategy.list_tables_sql())
+                .await
+                .map_err(|error| error.to_string());
+
+            let _ = sender.send(AppEvent::MetadataLoaded {
+                task_id,
+                schemas,
+                tables,
+            });
+        });
     }
 
     fn resolve_table(&self, value: Option<&str>) -> Option<TableRef> {
@@ -689,19 +741,132 @@ impl App {
             })
     }
 
-    fn set_output_result(&mut self, result: Result<QueryOutput>, status: impl Into<String>) {
+    fn poll_task_events(&mut self) {
+        while let Ok(event) = self.task_rx.try_recv() {
+            self.handle_app_event(event);
+        }
+    }
+
+    fn handle_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::MetadataLoaded {
+                task_id,
+                schemas,
+                tables,
+            } => self.finish_metadata_load(task_id, schemas, tables),
+            AppEvent::QueryFinished {
+                task_id,
+                result,
+                success_status,
+                failure_status,
+            } => {
+                if self.active_view_task == Some(task_id) {
+                    self.active_view_task = None;
+                    self.set_output_result(result, success_status, failure_status);
+                }
+            }
+            AppEvent::TableDetailLoaded { task_id, result } => {
+                if self.active_view_task == Some(task_id) {
+                    self.active_view_task = None;
+                    self.finish_table_detail_load(result);
+                }
+            }
+        }
+    }
+
+    fn finish_metadata_load(
+        &mut self,
+        task_id: u64,
+        schemas: TaskResult<QueryOutput>,
+        tables: TaskResult<QueryOutput>,
+    ) {
+        if self.metadata_task != Some(task_id) {
+            return;
+        }
+        self.metadata_task = None;
+
+        match (schemas, tables) {
+            (Ok(schemas), Ok(tables)) => {
+                self.metadata.schemas = rows_by_column(&schemas, "schema");
+                self.metadata.tables = table_refs(&tables);
+                self.metadata.loaded = true;
+                self.selected_table = self
+                    .selected_table
+                    .min(self.metadata.tables.len().saturating_sub(1));
+
+                if self.active_view_task == Some(task_id) {
+                    self.active_view_task = None;
+                    self.view = OutputView::Query(tables);
+                    self.output_scroll = 0;
+                    self.status = format!(
+                        "loaded {} schema(s), {} table(s)",
+                        self.metadata.schemas.len(),
+                        self.metadata.tables.len()
+                    );
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                if self.active_view_task == Some(task_id) {
+                    self.active_view_task = None;
+                    self.view = OutputView::message(format!("metadata load failed: {error}"));
+                    self.output_scroll = 0;
+                    self.status = "metadata load failed".to_string();
+                }
+            }
+        }
+    }
+
+    fn finish_table_detail_load(&mut self, result: TaskResult<TableDetail>) {
+        match result {
+            Ok(detail) => {
+                let order_label = detail.options.order.label(detail.order_column.as_deref());
+                self.status = format!(
+                    "{} preview: {} row limit, {} order",
+                    detail.table.display_name(),
+                    detail.options.limit,
+                    order_label
+                );
+                self.view = OutputView::Detail(detail);
+                self.output_scroll = 0;
+            }
+            Err(error) => {
+                let status = if error.starts_with("describe failed") {
+                    "describe failed"
+                } else if error.starts_with("sample failed") {
+                    "sample failed"
+                } else {
+                    "preview failed"
+                };
+                self.view = OutputView::message(error);
+                self.output_scroll = 0;
+                self.status = status.to_string();
+            }
+        }
+    }
+
+    fn set_output_result(
+        &mut self,
+        result: TaskResult<QueryOutput>,
+        success_status: impl Into<String>,
+        failure_status: impl Into<String>,
+    ) {
         match result {
             Ok(output) => {
                 self.view = OutputView::Query(output);
                 self.output_scroll = 0;
-                self.status = status.into();
+                self.status = success_status.into();
             }
             Err(error) => {
-                self.view = OutputView::message(error.to_string());
+                self.view = OutputView::message(error);
                 self.output_scroll = 0;
-                self.status = "SQL failed".to_string();
+                self.status = failure_status.into();
             }
         }
+    }
+
+    fn next_task_id(&mut self) -> u64 {
+        self.next_task_id = self.next_task_id.saturating_add(1);
+        self.next_task_id
     }
 
     fn set_safe_mode(&mut self, safe_mode: bool) {

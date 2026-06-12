@@ -19,7 +19,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
     "time",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 url = "2.5"
 
 [dev-dependencies]

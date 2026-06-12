@@ -24,6 +24,7 @@ impl QueryOutput {
     }
 }
 
+#[derive(Clone)]
 pub enum DatabaseClient {
     Postgres(PgPool),
     Mysql(MySqlPool),

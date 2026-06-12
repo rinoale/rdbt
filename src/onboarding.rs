@@ -15,7 +15,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use rustui::{runtime::spawn_event_reader, style::Role};
-use tokio::time::{self, timeout};
+use tokio::{
+    sync::mpsc,
+    time::{self, timeout},
+};
 
 use crate::{
     args::{Config, Dbms, build_url, default_port},
@@ -141,6 +144,13 @@ impl HostChoice {
     }
 }
 
+enum ConnectionEvent {
+    Finished {
+        task_id: u64,
+        result: std::result::Result<(Config, DatabaseClient), String>,
+    },
+}
+
 #[derive(Debug)]
 struct OnboardingApp {
     dbms: Dbms,
@@ -156,6 +166,11 @@ struct OnboardingApp {
     command_mode: bool,
     command_input: String,
     status: String,
+    connecting: bool,
+    connection_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    connection_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
+    next_connection_task_id: u64,
+    active_connection_task: Option<u64>,
     canceled: bool,
 }
 
@@ -171,6 +186,7 @@ impl OnboardingApp {
             .port
             .unwrap_or_else(|| default_port(defaults.dbms))
             .to_string();
+        let (connection_tx, connection_rx) = mpsc::unbounded_channel();
         Self {
             dbms: defaults.dbms,
             host_choice,
@@ -185,6 +201,11 @@ impl OnboardingApp {
             command_mode: false,
             command_input: String::new(),
             status: "choose connector and connection settings".to_string(),
+            connecting: false,
+            connection_tx,
+            connection_rx,
+            next_connection_task_id: 0,
+            active_connection_task: None,
             canceled: false,
         }
     }
@@ -197,6 +218,10 @@ impl OnboardingApp {
         let mut tick = time::interval(Duration::from_millis(100));
 
         while !self.canceled {
+            if let Some(connection) = self.poll_connection_events() {
+                return Ok(Some(connection));
+            }
+
             terminal.draw(|frame| self.render(frame))?;
 
             tokio::select! {
@@ -204,10 +229,7 @@ impl OnboardingApp {
                     match maybe_event {
                         Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                             if self.handle_key(key) == FormAction::Connect {
-                                terminal.draw(|frame| self.render(frame))?;
-                                if let Some(connection) = self.connect().await? {
-                                    return Ok(Some(connection));
-                                }
+                                self.start_connect();
                             }
                         }
                         Some(Event::Paste(text)) => self.append_text(&text),
@@ -323,7 +345,6 @@ impl OnboardingApp {
 
     fn enter_or_advance(&mut self) -> FormAction {
         if self.focus == Field::Connect {
-            self.status = "connecting...".to_string();
             FormAction::Connect
         } else {
             self.focus = self.focus.next();
@@ -367,29 +388,68 @@ impl OnboardingApp {
         })
     }
 
-    async fn connect(&mut self) -> Result<Option<(Config, DatabaseClient)>> {
+    fn start_connect(&mut self) {
+        if self.connecting {
+            self.status = "connection already in progress".to_string();
+            return;
+        }
+
         let config = match self.to_config() {
             Ok(config) => config,
             Err(message) => {
                 self.status = message;
-                return Ok(None);
+                return;
             }
         };
 
+        let task_id = self.next_connection_task_id();
+        self.active_connection_task = Some(task_id);
+        self.connecting = true;
         self.status = format!("connecting to {}...", connection_label(&config));
-        match timeout(CONNECT_TIMEOUT, DatabaseClient::connect(&config)).await {
-            Ok(Ok(client)) => Ok(Some((config, client))),
-            Ok(Err(error)) => {
-                self.status = format!("connection failed: {error}");
-                self.focus = Field::Connect;
-                Ok(None)
-            }
-            Err(_) => {
-                self.status = format!("connection timed out after {}s", CONNECT_TIMEOUT.as_secs());
-                self.focus = Field::Connect;
-                Ok(None)
+
+        let sender = self.connection_tx.clone();
+        tokio::spawn(async move {
+            let connection_config = config.clone();
+            let result = match timeout(CONNECT_TIMEOUT, DatabaseClient::connect(&config)).await {
+                Ok(Ok(client)) => Ok((connection_config, client)),
+                Ok(Err(error)) => Err(format!("connection failed: {error}")),
+                Err(_) => Err(format!(
+                    "connection timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                )),
+            };
+
+            let _ = sender.send(ConnectionEvent::Finished { task_id, result });
+        });
+    }
+
+    fn poll_connection_events(&mut self) -> Option<(Config, DatabaseClient)> {
+        while let Ok(event) = self.connection_rx.try_recv() {
+            match event {
+                ConnectionEvent::Finished { task_id, result } => {
+                    if self.active_connection_task != Some(task_id) {
+                        continue;
+                    }
+                    self.active_connection_task = None;
+                    self.connecting = false;
+
+                    match result {
+                        Ok(connection) => return Some(connection),
+                        Err(message) => {
+                            self.status = message;
+                            self.focus = Field::Connect;
+                        }
+                    }
+                }
             }
         }
+
+        None
+    }
+
+    fn next_connection_task_id(&mut self) -> u64 {
+        self.next_connection_task_id = self.next_connection_task_id.saturating_add(1);
+        self.next_connection_task_id
     }
 
     fn backspace(&mut self) {
