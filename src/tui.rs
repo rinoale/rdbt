@@ -8,7 +8,7 @@ pub(crate) mod theme;
 use color_eyre::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
         MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
@@ -19,7 +19,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
-use rustui::style::Role;
+use rustui::{runtime::spawn_event_reader, style::Role};
+use tokio::time;
 
 use crate::{
     args::Config,
@@ -218,18 +219,24 @@ impl App {
 
     async fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         self.load_metadata_if_needed().await;
+        let mut events = spawn_event_reader();
+        let mut tick = time::interval(Duration::from_millis(100));
 
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
 
-            if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        self.handle_key(key).await;
+            tokio::select! {
+                maybe_event = events.recv() => {
+                    match maybe_event {
+                        Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            self.handle_key(key).await;
+                        }
+                        Some(Event::Mouse(mouse)) => self.handle_mouse(mouse).await,
+                        Some(_) => {}
+                        None => break,
                     }
-                    Event::Mouse(mouse) => self.handle_mouse(mouse).await,
-                    _ => {}
                 }
+                _ = tick.tick() => {}
             }
         }
 

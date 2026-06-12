@@ -3,7 +3,7 @@ use std::{io::stdout, time::Duration};
 use color_eyre::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers,
     },
     execute,
@@ -14,8 +14,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use rustui::style::Role;
-use tokio::time::timeout;
+use rustui::{runtime::spawn_event_reader, style::Role};
+use tokio::time::{self, timeout};
 
 use crate::{
     args::{Config, Dbms, build_url, default_port},
@@ -193,22 +193,29 @@ impl OnboardingApp {
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
     ) -> Result<Option<(Config, DatabaseClient)>> {
+        let mut events = spawn_event_reader();
+        let mut tick = time::interval(Duration::from_millis(100));
+
         while !self.canceled {
             terminal.draw(|frame| self.render(frame))?;
 
-            if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if self.handle_key(key) == FormAction::Connect {
-                            terminal.draw(|frame| self.render(frame))?;
-                            if let Some(connection) = self.connect().await? {
-                                return Ok(Some(connection));
+            tokio::select! {
+                maybe_event = events.recv() => {
+                    match maybe_event {
+                        Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            if self.handle_key(key) == FormAction::Connect {
+                                terminal.draw(|frame| self.render(frame))?;
+                                if let Some(connection) = self.connect().await? {
+                                    return Ok(Some(connection));
+                                }
                             }
                         }
+                        Some(Event::Paste(text)) => self.append_text(&text),
+                        Some(_) => {}
+                        None => break,
                     }
-                    Event::Paste(text) => self.append_text(&text),
-                    _ => {}
                 }
+                _ = tick.tick() => {}
             }
         }
 
